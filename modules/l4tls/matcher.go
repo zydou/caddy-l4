@@ -37,8 +37,16 @@ func init() {
 type MatchTLS struct {
 	MatchersRaw caddy.ModuleMap `json:"-" caddy:"namespace=tls.handshake_match"`
 
-	matchers []caddytls.ConnectionMatcher
-	logger   *zap.Logger
+	// TelegramSecrets is a list of Telegram proxy secrets (hex format).
+	// When provided, caddy-l4 verifies the HMAC in the ClientHello's
+	// "random" field to distinguish Telegram FakeTLS from real browser TLS.
+	// If HMAC verification succeeds, the connection is treated as NOT TLS
+	// and will be forwarded to the non-TLS route (e.g. mtg).
+	TelegramSecrets []string `json:"telegram_secrets,omitempty"`
+
+	matchers   []caddytls.ConnectionMatcher
+	logger     *zap.Logger
+	secretKeys [][]byte // parsed from TelegramSecrets
 }
 
 // CaddyModule returns the Caddy module information.
@@ -51,12 +59,34 @@ func (*MatchTLS) CaddyModule() caddy.ModuleInfo {
 
 // UnmarshalJSON satisfies the json.Unmarshaler interface.
 func (m *MatchTLS) UnmarshalJSON(b []byte) error {
-	return json.Unmarshal(b, &m.MatchersRaw)
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return err
+	}
+	if secs, ok := raw["telegram_secrets"]; ok {
+		if err := json.Unmarshal(secs, &m.TelegramSecrets); err != nil {
+			return err
+		}
+		delete(raw, "telegram_secrets")
+	}
+	m.MatchersRaw = caddy.ModuleMap(raw)
+	return nil
 }
 
 // MarshalJSON satisfies the json.Marshaler interface.
 func (m *MatchTLS) MarshalJSON() ([]byte, error) {
-	return json.Marshal(m.MatchersRaw)
+	result := make(map[string]json.RawMessage, len(m.MatchersRaw)+1)
+	for k, v := range m.MatchersRaw {
+		result[k] = v
+	}
+	if len(m.TelegramSecrets) > 0 {
+		b, err := json.Marshal(m.TelegramSecrets)
+		if err != nil {
+			return nil, err
+		}
+		result["telegram_secrets"] = b
+	}
+	return json.Marshal(result)
 }
 
 // Provision sets up the handler.
@@ -69,6 +99,22 @@ func (m *MatchTLS) Provision(ctx caddy.Context) error {
 	for _, modIface := range mods.(map[string]any) {
 		m.matchers = append(m.matchers, modIface.(caddytls.ConnectionMatcher))
 	}
+
+	// Parse Telegram secrets into HMAC keys
+	for _, secret := range m.TelegramSecrets {
+		key, err := parseTelegramSecret(secret)
+		if err != nil {
+			return fmt.Errorf("parsing Telegram secret: %v", err)
+		}
+		m.secretKeys = append(m.secretKeys, key)
+	}
+
+	if len(m.secretKeys) > 0 {
+		m.logger.Info("Telegram FakeTLS HMAC detection enabled",
+			zap.Int("num_secrets", len(m.secretKeys)),
+		)
+	}
+
 	return nil
 }
 
@@ -96,6 +142,15 @@ func (m *MatchTLS) Match(cx *layer4.Connection) (bool, error) {
 		return false, err
 	}
 
+	// Keep a copy of the full ClientHello including TLS record headers.
+	// Telegram FakeTLS computes its HMAC over the entire ClientHello
+	// including record headers (see Telegram TlsInit), so the record
+	// headers must be preserved for HMAC verification. rawHello (without
+	// record headers) is still used for ClientHello parsing below.
+	fullHello := make([]byte, 0, recordHeaderLen+len(rawHello))
+	fullHello = append(fullHello, hdr...)
+	fullHello = append(fullHello, rawHello...)
+
 	// Ensure we have at least 4 bytes handshake header before parsing length.
 	for len(rawHello) < 4 {
 		hdr2 := make([]byte, recordHeaderLen)
@@ -120,6 +175,8 @@ func (m *MatchTLS) Match(cx *layer4.Connection) (bool, error) {
 			return false, err
 		}
 
+		fullHello = append(fullHello, hdr2...)
+		fullHello = append(fullHello, body2...)
 		rawHello = append(rawHello, body2...)
 	}
 
@@ -156,8 +213,19 @@ func (m *MatchTLS) Match(cx *layer4.Connection) (bool, error) {
 				return false, err
 			}
 
+			fullHello = append(fullHello, hdr2...)
+			fullHello = append(fullHello, body2...)
 			rawHello = append(rawHello, body2...)
 		}
+	}
+
+	// Check if this is Telegram's FakeTLS by verifying the HMAC.
+	// If HMAC verification succeeds, it's Telegram traffic → NOT real TLS.
+	if len(m.secretKeys) > 0 && tryVerifyFakeTLS(fullHello, m.secretKeys, m.logger) {
+                m.logger.Info("detected Telegram FakeTLS via HMAC, forwarding to:",
+			zap.String("remote", cx.RemoteAddr().String()),
+		)
+		return false, nil
 	}
 
 	// parse the ClientHello
@@ -197,14 +265,73 @@ func (m *MatchTLS) Match(cx *layer4.Connection) (bool, error) {
 //	}
 //	tls matcher [<args...>]
 //	tls
+//
+// With Telegram secrets for FakeTLS detection:
+//
+//	tls {
+//		telegram_secrets <secret1> [<secret2> ...]
+//	}
 func (m *MatchTLS) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	d.Next() // consume wrapper name
 
-	matcherSet, err := ParseCaddyfileNestedMatcherSet(d)
-	if err != nil {
-		return err
+	// First, collect all tokens in this block for nested matcher parsing
+	tokensByMatcherName := make(map[string][]caddyfile.Token)
+	var telegramSecrets []string
+
+	for nesting := d.Nesting(); d.NextArg() || d.NextBlock(nesting); {
+		token := d.Val()
+		if token == "telegram_secrets" {
+			// Collect all remaining args on this line as secrets
+			for d.NextArg() {
+				telegramSecrets = append(telegramSecrets, d.Val())
+			}
+		} else {
+			// It's a nested matcher - collect its tokens
+			tokensByMatcherName[token] = append(tokensByMatcherName[token], d.NextSegment()...)
+		}
 	}
-	m.MatchersRaw = matcherSet
+
+	m.TelegramSecrets = telegramSecrets
+
+	// Parse nested matchers if any
+	if len(tokensByMatcherName) > 0 {
+		matcherMap := make(map[string]caddytls.ConnectionMatcher)
+		for matcherName, tokens := range tokensByMatcherName {
+			dd := caddyfile.NewDispenser(tokens)
+			dd.Next() // consume wrapper name
+
+			mod, err := caddy.GetModule("tls.handshake_match." + matcherName)
+			if err != nil {
+				return fmt.Errorf("getting matcher module '%s': %v", matcherName, err)
+			}
+			unm, ok := mod.New().(caddyfile.Unmarshaler)
+			if !ok {
+				return fmt.Errorf("matcher module '%s' is not a Caddyfile unmarshaler", matcherName)
+			}
+			err = unm.UnmarshalCaddyfile(dd.NewFromNextSegment())
+			if err != nil {
+				return err
+			}
+			cm, ok := unm.(caddytls.ConnectionMatcher)
+			if !ok {
+				return fmt.Errorf("matcher module '%s' is not a connection matcher", matcherName)
+			}
+			matcherMap[matcherName] = cm
+		}
+
+		matcherSet := make(caddy.ModuleMap)
+		for name, matcher := range matcherMap {
+			jsonBytes, err := json.Marshal(matcher)
+			if err != nil {
+				return fmt.Errorf("marshaling %T matcher: %v", matcher, err)
+			}
+			matcherSet[name] = jsonBytes
+		}
+		m.MatchersRaw = matcherSet
+	} else {
+		// No nested matchers - set empty map to avoid null
+		m.MatchersRaw = make(caddy.ModuleMap)
+	}
 
 	return nil
 }
